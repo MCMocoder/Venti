@@ -12,110 +12,223 @@
 #pragma once
 
 #include <coroutine>
+#include <exception>
 #include <functional>
-#include "venti/event.h"
 
 #include "venti/context.h"
+#include "venti/coroutine.h"
+#include "venti/event.h"
 
 namespace mocoder::venti {
 
 using namespace std;
 
 template <typename T>
-class Async {
+struct Result {
+  explicit Result() = default;
+
+  explicit Result(T&& value) : value_(value) {}
+
+  explicit Result(std::exception_ptr&& exception_ptr)
+      : exception_ptr_(exception_ptr) {}
+
+  T Get() {
+    if (exception_ptr_) {
+      std::rethrow_exception(exception_ptr_);
+    }
+    return value_;
+  }
+
+ private:
+  T value_{};
+  std::exception_ptr exception_ptr_;
+};
+
+template <>
+struct Result<void> {
+  explicit Result() = default;
+
+  explicit Result(std::exception_ptr&& exception_ptr)
+      : exception_ptr_(exception_ptr) {}
+
+  void Get() {
+    if (exception_ptr_) {
+      std::rethrow_exception(exception_ptr_);
+    }
+  }
+
+ private:
+  std::exception_ptr exception_ptr_;
+};
+
+template <typename T>
+class Future {
  public:
   struct promise_type;
 
   using CoroHandle = coroutine_handle<promise_type>;
   CoroHandle handle_;
 
-  Async(CoroHandle handle) : handle_(handle) {}
-  Async(const Async&) = delete;
-  Async(Async&& promise) : handle_(promise.handle_) {
+  Future(CoroHandle handle) : handle_(handle) {}
+  Future(const Future&) = delete;
+  Future(Future&& promise) : handle_(promise.handle_) {
     promise.handle_ = nullptr;
   }
 
-  Async& operator=(const Async&) = delete;
+  Future& operator=(const Future&) = delete;
 
-  Async& operator=(Async&& promise) {
+  Future& operator=(Future&& promise) {
     handle_ = promise.handle_;
     promise.handle_ = nullptr;
     return *this;
   }
-  
+
   T get() { return handle_.promise().value; }
 
-  struct promise_type {
-    T value;
-    auto get_return_object() {
-      return Async<T>{CoroHandle::from_promise(*this)};
+  bool await_ready() noexcept { return !handle_ || handle_.done(); }
+
+  bool await_suspend(coroutine_handle<> handle) noexcept {
+    return true;
     }
 
-    auto initial_suspend() { return suspend_never{}; }
+  bool await_suspend(CoroHandle handle) noexcept {
+    handle.promise().inner_ = handle_;
+    handle_.promise().outer_ = handle;
+    return true;
+  }
 
-    auto return_value(T v) {
-      value = v;
+  auto await_resume() noexcept {
+    return handle_.promise().result;
+  }
+
+  struct promise_type {
+    Result<T> result;
+    coroutine_handle<promise_type> inner_;
+    coroutine_handle<promise_type> outer_;
+
+    auto get_return_object() noexcept {
+      return Future<T>{CoroHandle::from_promise(*this)};
+    }
+
+    auto initial_suspend() noexcept { return suspend_never{}; }
+
+    auto return_value(T v) noexcept {
+      result = Result<T>(std::move(v));
       return suspend_never{};
     }
 
-    auto yield_value(T v) {
-      value = v;
-      return suspend_always{};
+    auto final_suspend() noexcept {
+      struct FinalAwaitable {
+        bool await_ready() noexcept { return false; }
+
+        coroutine_handle<> await_suspend(
+            coroutine_handle<promise_type> h) noexcept {
+          auto& promise = h.promise();
+          auto p = promise.outer_;
+          if (p) {
+            return p;
+          }
+          return noop_coroutine();
+        }
+
+        void await_resume() noexcept {}
+
+      };
+      return FinalAwaitable{};
+      //return suspend_never{};
     }
 
-    auto final_suspend() noexcept { return suspend_never{}; }
-
-    void unhandled_exception() { exit(255); }
+    void unhandled_exception() { result = Result<T>(std::current_exception()); }
   };
 };
 
 template <>
-class Async<void> {
+class Future<void> {
  public:
   struct promise_type;
 
   using CoroHandle = coroutine_handle<promise_type>;
   CoroHandle handle_;
 
-  Async(CoroHandle handle) : handle_(handle) {}
-  Async(const Async&) = delete;
-  Async(Async&& promise) : handle_(promise.handle_) {
+  Future(CoroHandle handle) : handle_(handle) {}
+  Future(const Future&) = delete;
+  Future(Future&& promise) : handle_(promise.handle_) {
     promise.handle_ = nullptr;
   }
 
-  Async& operator=(const Async&) = delete;
+  Future& operator=(const Future&) = delete;
 
-  Async& operator=(Async&& promise) {
+  Future& operator=(Future&& promise) {
     handle_ = promise.handle_;
     promise.handle_ = nullptr;
     return *this;
   }
 
-  struct promise_type {
-    auto get_return_object() {
-      return Async<void>{CoroHandle::from_promise(*this)};
+  bool await_ready() noexcept { return !handle_ || handle_.done(); }
+
+  bool await_suspend(coroutine_handle<> handle) noexcept {
+    return true;
     }
 
-    auto initial_suspend() { return suspend_never{}; }
+  bool await_suspend(CoroHandle handle) noexcept {
+    handle.promise().inner_ = handle_;
+    handle_.promise().outer_ = handle;
+    return true;
+  }
 
-    auto return_void() {
+  auto await_resume() noexcept {
+    return handle_.promise().result;
+  }
+
+  struct promise_type {
+    Result<void> result;
+    coroutine_handle<promise_type> inner_;
+    coroutine_handle<promise_type> outer_;
+
+    auto get_return_object() noexcept {
+      return Future<void>{CoroHandle::from_promise(*this)};
+    }
+
+    auto initial_suspend() noexcept { return suspend_never{}; }
+
+    auto return_void() { return suspend_never{}; }
+
+    auto final_suspend() noexcept {
+      struct FinalAwaitable {
+        bool await_ready() noexcept { return false; }
+
+        coroutine_handle<> await_suspend(
+            coroutine_handle<promise_type> h) noexcept {
+          auto& promise = h.promise();
+          auto p = promise.outer_;
+          if (p) {
+            return p;
+          }
+          return noop_coroutine();
+        }
+
+        void await_resume() noexcept {}
+
+      };
+      // return FinalAwaitable{};
       return suspend_never{};
     }
 
-    auto yield_void() {
-      return suspend_always{};
-    }
-
-    auto final_suspend() noexcept { return suspend_never{}; }
-
-    void unhandled_exception() { exit(255); }
+    void unhandled_exception() { result = Result<void>(std::current_exception()); }
   };
 };
 
-void CoroSpawn(Context& ctx, function<Async<void>()> fn) {
-  ctx.SubmitComplete(Event([fn](int, int) {
-    fn();
-  }));
-}
+template <typename T>
+class Stream {
 
-}
+  
+
+  struct promise_type {
+
+  };
+};
+
+template <>
+class Stream<void> {};
+
+}  // namespace mocoder::venti
